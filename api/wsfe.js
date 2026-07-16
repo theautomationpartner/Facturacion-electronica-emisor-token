@@ -14,6 +14,26 @@
 // -----------------------------------------------------------------------------
 
 const https = require('https');
+const zlib = require('zlib');
+
+const LOG = '[wsfe]';
+
+const ENDPOINTS = {
+  prod: 'https://servicios1.afip.gov.ar/wsfev1/service.asmx',
+  homo: 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx',
+};
+
+// EL PUNTO CLAVE DE TODO ESTE ARCHIVO:
+//   AFIP negocia DHE-RSA-AES256-GCM-SHA384 con un grupo Diffie-Hellman de 1024
+//   bits. OpenSSL 3 (Node 18+) usa por defecto security level 2, que exige DH de
+//   >=2048 bits, y corta con "dh key too small" — el mismo error que tira Make.
+//   O sea: sin esto el proxy falla igual que Make y no sirve para nada.
+//
+//   SECLEVEL=1 es la mínima concesión que hace falta: sigue exigiendo TLS 1.2 y
+//   sigue rechazando cifrados rotos; sólo acepta el DH corto de AFIP. No usar
+//   SECLEVEL=0, que además habilita cosas realmente inseguras.
+//   Aplica SOLO a esta conexión con AFIP, no al resto del proyecto.
+const AFIP_CIPHERS = 'DEFAULT@SECLEVEL=1';
 
 // Busca un header sin importar mayúsculas/minúsculas.
 function getHeader(headers, name) {
@@ -25,33 +45,65 @@ function getHeader(headers, name) {
   return undefined;
 }
 
-// Obtiene el body como texto, sin importar cómo lo entregue Vercel:
-//   - Si ya viene como string  -> lo usa.
-//   - Si viene como Buffer     -> lo convierte a texto.
-//   - Si viene como objeto     -> lo pasa a string (caso raro).
-//   - Si no vino nada          -> lo lee del stream de la request.
+// Obtiene el body como texto, sin importar cómo lo entregue Vercel.
+// Ojo: si Vercel ya consumió el stream, request.body es la única fuente; si no
+// lo consumió, request.body viene vacío y hay que leer el stream. Por eso se
+// chequean las dos cosas, en ese orden.
 function getRawBody(request) {
-  return new Promise((resolve) => {
-    const b = request.body;
+  const b = request.body;
 
-    if (typeof b === 'string') return resolve(b);
-    if (Buffer.isBuffer(b)) return resolve(b.toString('utf8'));
-    if (b && typeof b === 'object') {
-      // Vercel a veces entrega un objeto vacío {} cuando no supo parsear.
-      // En ese caso caemos a leer el stream. Si tiene contenido real, lo serializamos.
-      const keys = Object.keys(b);
-      if (keys.length > 0) return resolve(typeof b === 'string' ? b : JSON.stringify(b));
-    }
+  if (typeof b === 'string' && b.length > 0) return Promise.resolve(b);
+  if (Buffer.isBuffer(b) && b.length > 0) return Promise.resolve(b.toString('utf8'));
 
-    // Leer del stream entrante.
-    let data = '';
-    let terminado = false;
-    request.on('data', (chunk) => { data += chunk; });
-    request.on('end', () => { if (!terminado) { terminado = true; resolve(data); } });
-    request.on('error', () => { if (!terminado) { terminado = true; resolve(data); } });
-    // Red de seguridad: si el stream nunca dispara 'end', resolvemos igual a los 8s.
-    setTimeout(() => { if (!terminado) { terminado = true; resolve(data); } }, 8000);
+  // Si Vercel parseó el body a objeto, el XML original ya se perdió. No lo
+  // convertimos a JSON (eso le mandaba basura a AFIP y AFIP respondía 500).
+  // Con bodyParser:false esto no debería pasar nunca.
+  if (b && typeof b === 'object' && !Buffer.isBuffer(b) && Object.keys(b).length > 0) {
+    return Promise.reject(new Error(
+      'El body llegó parseado como objeto y el XML original se perdió. ' +
+      'Revisá que el módulo de Make mande Content-Type: text/xml con el XML crudo.'
+    ));
+  }
+
+  // Si el stream ya fue consumido (alguien lo leyó antes) y aun así el body vino
+  // vacío, el XML ya no existe: 'end' no se vuelve a disparar y quedarnos
+  // esperando colgaría la función hasta el timeout de Vercel. Cortamos claro.
+  if (request.readableEnded || request.complete) {
+    return Promise.reject(new Error(
+      'El stream del request ya fue consumido y request.body llegó vacío: ' +
+      'no se puede recuperar el XML. Revisá la config de bodyParser.'
+    ));
+  }
+
+  // Caso normal: leer el stream entrante como binario y recién ahí decodificar
+  // (concatenar strings rompe caracteres multi-byte partidos entre chunks).
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let listo = false;
+    const terminar = (fn, arg) => { if (!listo) { listo = true; fn(arg); } };
+
+    request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    request.on('end', () => terminar(resolve, Buffer.concat(chunks).toString('utf8')));
+    request.on('error', (e) => terminar(reject, e));
+
+    // Red de seguridad: nunca colgarse esperando un stream que no termina.
+    const t = setTimeout(
+      () => terminar(reject, new Error('Timeout de 10s leyendo el body del request')),
+      10000
+    );
+    if (typeof t.unref === 'function') t.unref();
   });
+}
+
+// Descomprime la respuesta según el Content-Encoding que haya declarado AFIP.
+// No pedimos compresión, pero si igual llega comprimida la manejamos.
+function decompress(buffer, encoding) {
+  const enc = String(encoding || '').toLowerCase().trim();
+  if (!buffer.length) return buffer;
+  if (enc === 'gzip') return zlib.gunzipSync(buffer);
+  if (enc === 'deflate') return zlib.inflateSync(buffer);
+  if (enc === 'br') return zlib.brotliDecompressSync(buffer);
+  return buffer;
 }
 
 // Hace el POST a AFIP usando el módulo https nativo (confiable en serverless).
@@ -60,30 +112,45 @@ function postAAfip(endpointUrl, soapBody, soapAction) {
     const u = new URL(endpointUrl);
     const payload = Buffer.from(soapBody, 'utf8');
 
-    const opciones = {
+    const req = https.request({
       hostname: u.hostname,
-      path: u.pathname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
       method: 'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
         'SOAPAction': soapAction,
         'Content-Length': payload.length,
+        // Pedimos explícitamente sin comprimir: menos superficie para fallar.
+        'Accept-Encoding': 'identity',
       },
-    };
-
-    const req = https.request(opciones, (res) => {
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      // Sin esto: "dh key too small". Ver comentario en AFIP_CIPHERS.
+      ciphers: AFIP_CIPHERS,
+      minVersion: 'TLSv1.2',
+      timeout: 30000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const raw = Buffer.concat(chunks);
+          const text = decompress(raw, res.headers['content-encoding']).toString('utf8');
+          resolve({ status: res.statusCode, body: text });
+        } catch (e) {
+          reject(new Error('No se pudo descomprimir la respuesta de AFIP: ' + e.message));
+        }
+      });
+      res.on('error', reject);
     });
 
-    req.on('error', (err) => reject(err));
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('AFIP no respondió en 30s')));
     req.write(payload);
     req.end();
   });
 }
 
-module.exports = async function (request, response) {
+async function wsfeHandler(request, response) {
   try {
     if (request.method !== 'POST') {
       response.setHeader('Content-Type', 'application/json');
@@ -93,27 +160,40 @@ module.exports = async function (request, response) {
     const soapBody = await getRawBody(request);
 
     if (!soapBody || soapBody.trim() === '') {
+      console.error(LOG, 'Body vacío. content-type=', getHeader(request.headers, 'content-type'));
       response.setHeader('Content-Type', 'application/json');
       return response.status(400).send(JSON.stringify({ ok: false, error: 'Body vacío: falta el XML SOAP' }));
     }
 
     const soapAction = getHeader(request.headers, 'SOAPAction') || '';
-
-    // Endpoint AFIP: producción por defecto. Homologación con header x-afip-env: homo
-    const env = (getHeader(request.headers, 'x-afip-env') || 'prod').toLowerCase();
-    const endpoint = env === 'homo'
-      ? 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx'
-      : 'https://servicios1.afip.gov.ar/wsfev1/service.asmx';
+    const env = String(getHeader(request.headers, 'x-afip-env') || 'prod').toLowerCase();
+    const endpoint = ENDPOINTS[env] || ENDPOINTS.prod;
 
     const afip = await postAAfip(endpoint, soapBody, soapAction);
 
-    // Devolvemos la respuesta de AFIP tal cual, para que Make la parsee igual que antes.
+    // AFIP devuelve HTTP 500 con un SOAP Fault adentro cuando algo del XML no le
+    // gusta. Lo dejamos pasar tal cual (es lo que Make recibía antes yendo
+    // directo), pero lo logueamos para poder diagnosticar desde Vercel.
+    if (afip.status >= 400) {
+      console.error(LOG, 'AFIP respondió', afip.status, 'para SOAPAction=', soapAction);
+      console.error(LOG, 'cuerpo:', afip.body.slice(0, 1000));
+    }
+
     response.setHeader('Content-Type', 'text/xml; charset=utf-8');
     return response.status(afip.status || 200).send(afip.body);
 
   } catch (e) {
-    // Cualquier error interno lo devolvemos legible, para poder diagnosticar.
+    const msg = String((e && e.message) || e);
+    console.error(LOG, 'Error en el proxy:', msg, e && e.stack);
     response.setHeader('Content-Type', 'application/json');
-    return response.status(500).send(JSON.stringify({ ok: false, error: String(e && e.message || e) }));
+    return response.status(500).send(JSON.stringify({ ok: false, error: msg }));
   }
-};
+}
+
+module.exports = wsfeHandler;
+
+// Le pedimos a Vercel que NO toque el body: lo queremos crudo, tal cual llega.
+// Sin esto Vercel puede parsearlo y dejar request.body como objeto, perdiendo el
+// XML. Tiene que ir DESPUÉS del module.exports de arriba: al revés se pisa.
+// El handler igual funciona si Vercel ignora esta config (lee request.body).
+module.exports.config = { api: { bodyParser: false } };
