@@ -65,10 +65,16 @@ function getRawBody(request) {
     ));
   }
 
-  // Si el stream ya fue consumido (alguien lo leyó antes) y aun así el body vino
-  // vacío, el XML ya no existe: 'end' no se vuelve a disparar y quedarnos
-  // esperando colgaría la función hasta el timeout de Vercel. Cortamos claro.
-  if (request.readableEnded || request.complete) {
+  // Si el stream ya fue consumido y aun así el body vino vacío, el XML ya no
+  // existe: 'end' no se vuelve a disparar y esperarlo colgaría la función.
+  //
+  // OJO: acá va readableEnded, NO request.complete. Son cosas distintas:
+  //   complete      = el mensaje HTTP se recibió entero (Vercel bufferea el
+  //                   request antes de invocar, así que llega true de entrada,
+  //                   con el body todavía sin leer y perfectamente disponible).
+  //   readableEnded = ya se emitió 'end', o sea alguien YA lo consumió.
+  // Usar complete acá abortaba en Vercel con el XML intacto en el buffer.
+  if (request.readableEnded) {
     return Promise.reject(new Error(
       'El stream del request ya fue consumido y request.body llegó vacío: ' +
       'no se puede recuperar el XML. Revisá la config de bodyParser.'
